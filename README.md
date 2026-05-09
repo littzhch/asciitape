@@ -1,33 +1,10 @@
 # asciitape
 
-A terminal UI player for asciinema v2 and v3 `.cast` recordings.
-
-The player uses Alacritty's terminal emulator core to replay recorded terminal output, then renders the resulting terminal grid with Ratatui and Crossterm.
+A convient TUI player for asciinema recordings (v2 and v3 `.cast`).
 
 ## Features
-
-- Plays asciinema v2 and v3 recordings.
-- Supports play, pause, seek, fast forward, rewind, speed control, and fullscreen mode.
-- Supports mouse dragging on the progress bar.
-- Uses Alacritty terminal emulation for ANSI/CSI/OSC processing.
-- Preserves common cell styles including foreground/background color, bold, dim, italic, underline, inverse, and strikeout.
-- Reads recorded terminal metadata such as `TERM`, `term.type`, and v3 `term.theme`.
-- Applies profile-aware color strategy for monochrome, ANSI 16-color, ANSI 256-color, and truecolor recordings.
-- Handles v3 relative event timing, comments, resize events, and `idle_time_limit`.
-
-## Installation
-
-From this repository:
-
-```bash
-cargo install --path .
-```
-
-Or run without installing:
-
-```bash
-cargo run -- path/to/recording.cast
-```
+- Supports progress bar with mouse drag.
+- Supports pause, seek, fast forward, rewind, speed control, and fullscreen mode.
 
 ## Usage
 
