@@ -4,6 +4,7 @@ version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "A terminal UI player for asciinema v2 and v3 cast recordings"
+license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/asciitape"
 keywords = ["asciinema", "tui", "terminal", "cast", "player"]
