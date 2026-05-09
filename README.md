@@ -1,6 +1,6 @@
 # asciitape
 
-A convient TUI player for asciinema recordings (v2 and v3 `.cast`).
+A convenient TUI player for asciinema recordings (v2 and v3 `.cast`).
 
 ## Features
 - Supports progress bar with mouse drag.
@@ -74,3 +74,14 @@ The internal timeline is normalized to absolute seconds. v2 absolute event times
 - OSC 8 hyperlinks may be parsed by the emulator but are not exposed in the TUI output.
 - Clipboard and terminal query sequences that require a live PTY response are not answered during offline playback.
 - Seeking rebuilds terminal state by replaying events from the beginning, which can be slow for very large recordings.
+
+## Build
+
+Install the Rust toolchain first:
+
+- https://www.rust-lang.org/tools/install
+
+```bash
+cargo build
+cargo build --release
+```
