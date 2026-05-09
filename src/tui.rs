@@ -45,6 +45,7 @@ struct App {
     playing: bool,
     fullscreen: bool,
     dragging_progress: bool,
+    pending_progress_seek: Option<f64>,
     progress_area: Option<Rect>,
     last_tick: Instant,
     mode: InputMode,
@@ -63,6 +64,7 @@ impl App {
             playing: !paused,
             fullscreen,
             dragging_progress: false,
+            pending_progress_seek: None,
             progress_area: None,
             last_tick: Instant::now(),
             mode: InputMode::Normal,
@@ -104,9 +106,27 @@ impl App {
     }
 
     fn seek(&mut self, position: f64) {
-        self.position = position.clamp(0.0, self.cast.duration);
-        self.replay_until_position();
+        let position = position.clamp(0.0, self.cast.duration);
+
+        if position >= self.position {
+            self.position = position;
+            self.apply_pending_events();
+        } else {
+            self.position = position;
+            self.replay_until_position();
+        }
+
         self.last_tick = Instant::now();
+    }
+
+    fn queue_progress_seek(&mut self, percent: f64) {
+        self.pending_progress_seek = Some(percent);
+    }
+
+    fn apply_pending_progress_seek(&mut self) {
+        if let Some(percent) = self.pending_progress_seek.take() {
+            self.seek_percent(percent);
+        }
     }
 
     fn speed_up(&mut self) {
@@ -193,27 +213,54 @@ fn restore_terminal(terminal: &mut RatatuiTerminal<CrosstermBackend<Stdout>>) ->
 }
 
 fn run_app(terminal: &mut RatatuiTerminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
-    loop {
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .context("failed to draw frame")?;
+    terminal
+        .draw(|frame| draw(frame, &mut app))
+        .context("failed to draw frame")?;
 
-        if event::poll(TICK_RATE).context("failed to poll events")? {
-            let event = event::read().context("failed to read event")?;
-            if handle_event(&mut app, event)? {
-                return Ok(());
-            }
+    loop {
+        if handle_pending_events(&mut app)? {
+            return Ok(());
         }
 
         app.tick();
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .context("failed to draw frame")?;
     }
+}
+
+fn handle_pending_events(app: &mut App) -> Result<bool> {
+    if !event::poll(TICK_RATE).context("failed to poll events")? {
+        return Ok(false);
+    }
+
+    loop {
+        let event = event::read().context("failed to read event")?;
+        if handle_event(app, event)? {
+            return Ok(true);
+        }
+
+        if !event::poll(Duration::ZERO).context("failed to poll queued events")? {
+            break;
+        }
+    }
+
+    app.apply_pending_progress_seek();
+    Ok(false)
 }
 
 fn handle_event(app: &mut App, event: Event) -> Result<bool> {
     match event {
-        Event::Key(key) => handle_key_event(app, key),
+        Event::Key(key) => {
+            app.apply_pending_progress_seek();
+            handle_key_event(app, key)
+        }
         Event::Mouse(mouse) => handle_mouse_event(app, mouse),
-        _ => Ok(false),
+        _ => {
+            app.apply_pending_progress_seek();
+            Ok(false)
+        }
     }
 }
 
@@ -239,15 +286,15 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<bool> {
             if rect_contains(progress_area, mouse.column, mouse.row) =>
         {
             app.dragging_progress = true;
-            seek_to_mouse_progress(app, progress_area, mouse.column);
+            queue_mouse_progress_seek(app, progress_area, mouse.column);
         }
         MouseEventKind::Down(_) => app.dragging_progress = false,
         MouseEventKind::Drag(MouseButton::Left) if app.dragging_progress => {
-            seek_to_mouse_progress(app, progress_area, mouse.column);
+            queue_mouse_progress_seek(app, progress_area, mouse.column);
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if app.dragging_progress {
-                seek_to_mouse_progress(app, progress_area, mouse.column);
+                queue_mouse_progress_seek(app, progress_area, mouse.column);
             }
             app.dragging_progress = false;
         }
@@ -257,9 +304,9 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<bool> {
     Ok(false)
 }
 
-fn seek_to_mouse_progress(app: &mut App, progress_area: Rect, column: u16) {
+fn queue_mouse_progress_seek(app: &mut App, progress_area: Rect, column: u16) {
     let percent = mouse_column_to_progress(progress_area, column);
-    app.seek_percent(percent);
+    app.queue_progress_seek(percent);
 }
 
 fn mouse_column_to_progress(progress_area: Rect, column: u16) -> f64 {
@@ -511,11 +558,41 @@ fn format_time(seconds: f64) -> String {
 mod tests {
     use super::*;
 
+    fn app_with_duration(duration: f64) -> App {
+        App::new(
+            Cast {
+                width: 2,
+                height: 1,
+                duration,
+                title: None,
+                terminal: crate::terminal::TerminalMetadata::default(),
+                events: Vec::new(),
+            },
+            true,
+            false,
+        )
+    }
+
     fn assert_close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() < 1e-9,
             "expected {expected}, got {actual}"
         );
+    }
+
+    #[test]
+    fn queued_progress_seek_applies_latest_drag_position() {
+        let mut app = app_with_duration(100.0);
+
+        app.queue_progress_seek(0.25);
+        app.queue_progress_seek(0.75);
+
+        assert_close(app.position, 0.0);
+
+        app.apply_pending_progress_seek();
+
+        assert_close(app.position, 75.0);
+        assert!(app.pending_progress_seek.is_none());
     }
 
     #[test]
