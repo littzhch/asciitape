@@ -160,6 +160,10 @@ impl AlacrittyEmulator {
         self.height = height;
     }
 
+    pub fn size(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+
     pub fn lines(&self, terminal: &TerminalMetadata) -> Vec<Line<'static>> {
         let renderable_content = self.term.renderable_content();
         let colors = renderable_content.colors;

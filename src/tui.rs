@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Gauge, Paragraph},
+    widgets::{Clear, Gauge, Paragraph},
 };
 
 use crate::{
@@ -46,6 +46,7 @@ struct App {
     fullscreen: bool,
     dragging_progress: bool,
     progress_area: Option<Rect>,
+    rendered_canvas_size: Option<(u16, u16)>,
     last_tick: Instant,
     mode: InputMode,
 }
@@ -64,6 +65,7 @@ impl App {
             fullscreen,
             dragging_progress: false,
             progress_area: None,
+            rendered_canvas_size: None,
             last_tick: Instant::now(),
             mode: InputMode::Normal,
         }
@@ -395,7 +397,7 @@ fn parse_resize_event(data: &str) -> Option<(u16, u16)> {
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.fullscreen {
         app.progress_area = None;
-        frame.render_widget(Paragraph::new(app.screen_lines()), frame.area());
+        render_terminal_canvas(frame, app, frame.area());
         return;
     }
 
@@ -409,7 +411,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    frame.render_widget(Paragraph::new(app.screen_lines()), vertical[0]);
+    render_terminal_canvas(frame, app, vertical[0]);
 
     let ratio = if app.cast.duration > 0.0 {
         (app.position / app.cast.duration).clamp(0.0, 1.0)
@@ -469,6 +471,59 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             footer_layout[1],
         );
     }
+}
+
+fn render_terminal_canvas(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let canvas = terminal_canvas_area(area, app.emulator.size());
+    let canvas_size = (canvas.width, canvas.height);
+
+    if let Some(previous_size) = app.rendered_canvas_size {
+        for clear_area in canvas_shrink_clear_areas(area, previous_size, canvas_size) {
+            frame.render_widget(Clear, clear_area);
+        }
+    }
+
+    app.rendered_canvas_size = Some(canvas_size);
+    frame.render_widget(Paragraph::new(app.screen_lines()), canvas);
+}
+
+fn terminal_canvas_area(area: Rect, terminal_size: (u16, u16)) -> Rect {
+    Rect::new(
+        area.x,
+        area.y,
+        area.width.min(terminal_size.0),
+        area.height.min(terminal_size.1),
+    )
+}
+
+fn canvas_shrink_clear_areas(
+    area: Rect,
+    previous_size: (u16, u16),
+    current_size: (u16, u16),
+) -> impl Iterator<Item = Rect> {
+    let previous_width = previous_size.0.min(area.width);
+    let previous_height = previous_size.1.min(area.height);
+    let current_width = current_size.0.min(area.width);
+    let current_height = current_size.1.min(area.height);
+
+    let bottom = (current_height < previous_height).then(|| {
+        Rect::new(
+            area.x,
+            area.y.saturating_add(current_height),
+            previous_width,
+            previous_height - current_height,
+        )
+    });
+    let right = (current_width < previous_width).then(|| {
+        Rect::new(
+            area.x.saturating_add(current_width),
+            area.y,
+            previous_width - current_width,
+            current_height,
+        )
+    });
+
+    [bottom, right].into_iter().flatten()
 }
 
 fn controls_line() -> Line<'static> {
@@ -537,5 +592,29 @@ mod tests {
         assert!(rect_contains(rect, 5, 4));
         assert!(!rect_contains(rect, 6, 4));
         assert!(!rect_contains(rect, 5, 5));
+    }
+
+    #[test]
+    fn canvas_area_is_clipped_to_terminal_size() {
+        let area = Rect::new(2, 3, 20, 10);
+
+        assert_eq!(terminal_canvas_area(area, (8, 4)), Rect::new(2, 3, 8, 4));
+        assert_eq!(terminal_canvas_area(area, (30, 12)), area);
+    }
+
+    #[test]
+    fn clear_areas_cover_only_canvas_shrink_regions() {
+        let area = Rect::new(0, 0, 20, 10);
+        let areas = canvas_shrink_clear_areas(area, (10, 4), (6, 2)).collect::<Vec<_>>();
+
+        assert_eq!(areas, vec![Rect::new(0, 2, 10, 2), Rect::new(6, 0, 4, 2)]);
+    }
+
+    #[test]
+    fn clear_areas_clip_previous_canvas_to_render_area() {
+        let area = Rect::new(2, 3, 8, 3);
+        let areas = canvas_shrink_clear_areas(area, (10, 4), (6, 2)).collect::<Vec<_>>();
+
+        assert_eq!(areas, vec![Rect::new(2, 5, 8, 1), Rect::new(8, 3, 2, 2)]);
     }
 }
