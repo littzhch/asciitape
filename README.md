@@ -130,6 +130,17 @@ cargo build
 cargo run -- --help
 ```
 
+## CI/CD
+
+- `CI` runs on every push to `master` and on every pull request.
+- `Release` runs on pushes to `master`, compares the package version in `Cargo.toml` with the previous commit, and only publishes when the version changed.
+- When a new version is detected, the workflow creates a draft GitHub release tagged as `vX.Y.Z`, uploads these binary archives, and then publishes the release after all builds succeed:
+  - `x86_64-unknown-linux-musl`
+  - `aarch64-unknown-linux-musl`
+  - `aarch64-apple-darwin`
+
+To publish a new version, bump `package.version` in `Cargo.toml` and merge that change into `master`.
+
 Release sanity check:
 
 ```bash

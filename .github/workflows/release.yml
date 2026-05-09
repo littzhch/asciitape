@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: asciitape
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.version.outputs.changed }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Cargo package version change
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_version=$(sed -n 's/^version = "\([^"]\+\)"$/\1/p' Cargo.toml | sed -n '1p')
+          if [[ -z "$current_version" ]]; then
+            echo "Failed to read package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          previous_version=""
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            previous_version=$(git show HEAD^:Cargo.toml 2>/dev/null | sed -n 's/^version = "\([^"]\+\)"$/\1/p' | sed -n '1p' || true)
+          fi
+
+          changed=false
+          if [[ -z "$previous_version" || "$current_version" != "$previous_version" ]]; then
+            changed=true
+          fi
+
+          echo "version=$current_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$current_version" >> "$GITHUB_OUTPUT"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft GitHub release
+        if: steps.version.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            --draft
+
+  build-release:
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_name: asciitape-x86_64-unknown-linux-musl.tar.gz
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive_name: asciitape-aarch64-unknown-linux-musl.tar.gz
+            use_cross: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_name: asciitape-aarch64-apple-darwin.tar.gz
+            use_cross: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "dist/${BINARY_NAME}"
+          tar -C dist -czf "${{ matrix.archive_name }}" "${BINARY_NAME}"
+
+      - name: Upload archive to GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${{ needs.prepare-release.outputs.tag }}" "${{ matrix.archive_name }}" --clobber
+
+  publish-release:
+    needs:
+      - prepare-release
+      - build-release
+    if: needs.prepare-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Publish GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "${{ needs.prepare-release.outputs.tag }}" --draft=false
