@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, BufRead, BufReader, Stdout},
     path::PathBuf,
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
     time::{Duration, Instant},
@@ -40,6 +41,9 @@ const TICK_RATE: Duration = Duration::from_millis(16);
 const EVENT_BATCH_SIZE: usize = 512;
 const EVENT_BATCH_LATENCY: Duration = Duration::from_millis(8);
 const WORKER_MESSAGES_PER_TICK: usize = 32;
+const SEEK_REPLAY_INTERRUPT_BATCH_SIZE: usize = 1024;
+const SEEK_LOADING_FRAME_DURATION: Duration = Duration::from_millis(100);
+const SEEK_LOADING_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 
 #[derive(Debug)]
 enum InputMode {
@@ -104,6 +108,51 @@ struct PreviewFrame {
     lines: Vec<Line<'static>>,
 }
 
+struct PlaybackState {
+    emulator: AlacrittyEmulator,
+    next_event: usize,
+    position: f64,
+}
+
+impl PlaybackState {
+    fn new(header: &CastHeader) -> Self {
+        Self {
+            emulator: AlacrittyEmulator::new(header.width, header.height, &header.terminal),
+            next_event: 0,
+            position: 0.0,
+        }
+    }
+}
+
+struct PendingSeek {
+    generation: u64,
+    target: f64,
+    started_at: Instant,
+    display_snapshot: Vec<Line<'static>>,
+}
+
+struct SeekRequest {
+    generation: u64,
+    target: f64,
+    active: Option<PlaybackState>,
+}
+
+#[derive(Clone, Copy)]
+struct SeekTarget {
+    generation: u64,
+    target: f64,
+}
+
+enum SeekCommand {
+    Seek(SeekRequest),
+    Recycle(PlaybackState),
+}
+
+struct SeekResult {
+    generation: u64,
+    state: PlaybackState,
+}
+
 impl PreviewCache {
     fn nearest_frame(&self, position: f64) -> Option<&PreviewFrame> {
         let index = preview_frame_index(position, self.duration, self.frames.len())?;
@@ -115,14 +164,15 @@ enum WorkerMessage {
     EventsLoaded(Vec<CastEvent>),
     EventsComplete { duration: f64 },
     PreviewReady(PreviewCache),
+    SeekReady(Box<SeekResult>),
     Failed(String),
 }
 
 struct App {
     header: CastHeader,
     events: EventBuffer,
-    emulator: AlacrittyEmulator,
-    next_event: usize,
+    playback: Option<PlaybackState>,
+    display_cache: Vec<Line<'static>>,
     position: f64,
     duration: Option<f64>,
     loaded_until: f64,
@@ -133,6 +183,9 @@ struct App {
     dragging_progress: bool,
     preview_position: Option<f64>,
     preview_cache: Option<PreviewCache>,
+    pending_seek: Option<PendingSeek>,
+    seek_generation: u64,
+    seek_tx: Option<Sender<SeekCommand>>,
     progress_area: Option<Rect>,
     last_tick: Instant,
     mode: InputMode,
@@ -143,15 +196,16 @@ struct App {
 
 impl App {
     fn new(path: PathBuf, header: CastHeader, paused: bool, fullscreen: bool) -> Self {
-        let emulator = AlacrittyEmulator::new(header.width, header.height, &header.terminal);
+        let playback = PlaybackState::new(&header);
+        let display_cache = playback.emulator.lines(&header.terminal);
         let (worker_tx, worker_rx) = mpsc::channel();
         start_event_loader(path, header.clone(), worker_tx.clone());
 
         Self {
             header,
             events: EventBuffer::Streaming(Vec::new()),
-            emulator,
-            next_event: 0,
+            playback: Some(playback),
+            display_cache,
             position: 0.0,
             duration: None,
             loaded_until: 0.0,
@@ -162,6 +216,9 @@ impl App {
             dragging_progress: false,
             preview_position: None,
             preview_cache: None,
+            pending_seek: None,
+            seek_generation: 0,
+            seek_tx: None,
             progress_area: None,
             last_tick: Instant::now(),
             mode: InputMode::Normal,
@@ -196,6 +253,12 @@ impl App {
                 self.load_state = LoadState::BuildingFrames;
 
                 let events = self.events.promote_to_loaded();
+                self.seek_tx = Some(start_seek_engine(
+                    Arc::clone(&events),
+                    self.header.clone(),
+                    duration,
+                    self.worker_tx.clone(),
+                ));
                 start_preview_builder(
                     events,
                     self.header.clone(),
@@ -211,6 +274,7 @@ impl App {
                 self.preview_cache = Some(cache);
                 self.load_state = LoadState::Ready;
             }
+            WorkerMessage::SeekReady(result) => self.handle_seek_ready(*result),
             WorkerMessage::Failed(error) => bail!("{error}"),
         }
 
@@ -223,7 +287,15 @@ impl App {
         self.last_tick = now;
         self.buffering = false;
 
+        if self.is_seeking() {
+            return;
+        }
+
         if !self.playing {
+            return;
+        }
+
+        if self.playback.is_none() {
             return;
         }
 
@@ -236,6 +308,9 @@ impl App {
             self.position = target;
         }
 
+        if let Some(playback) = self.playback.as_mut() {
+            playback.position = self.position;
+        }
         self.apply_pending_events();
 
         if let Some(duration) = self.duration
@@ -281,21 +356,80 @@ impl App {
         }
     }
 
+    fn recycle_playback(&self, state: PlaybackState) {
+        if let Some(seek_tx) = &self.seek_tx {
+            let _ = seek_tx.send(SeekCommand::Recycle(state));
+        }
+    }
+
+    fn set_pending_seek(
+        &mut self,
+        generation: u64,
+        target: f64,
+        display_snapshot: Vec<Line<'static>>,
+    ) {
+        self.pending_seek = Some(PendingSeek {
+            generation,
+            target,
+            started_at: Instant::now(),
+            display_snapshot,
+        });
+    }
+
+    fn request_seek(
+        &mut self,
+        target: f64,
+        active: Option<PlaybackState>,
+        display_snapshot: Vec<Line<'static>>,
+    ) -> (bool, Option<PlaybackState>) {
+        let Some(seek_tx) = self.seek_tx.clone() else {
+            return (false, active);
+        };
+
+        self.seek_generation = self.seek_generation.wrapping_add(1);
+        let generation = self.seek_generation;
+        self.set_pending_seek(generation, target, display_snapshot);
+
+        match seek_tx.send(SeekCommand::Seek(SeekRequest {
+            generation,
+            target,
+            active,
+        })) {
+            Ok(()) => (true, None),
+            Err(error) => {
+                self.pending_seek = None;
+                if let SeekCommand::Seek(request) = error.0 {
+                    (false, request.active)
+                } else {
+                    (false, None)
+                }
+            }
+        }
+    }
+
     fn seek(&mut self, position: f64) {
+        let display_snapshot = self.current_display_snapshot();
+        self.seek_with_snapshot(position, display_snapshot);
+    }
+
+    fn seek_with_snapshot(&mut self, position: f64, display_snapshot: Vec<Line<'static>>) {
         let Some(duration) = self.duration else {
             return;
         };
         let position = position.clamp(0.0, duration);
+        let active = self.playback.take();
 
-        if position >= self.position {
-            self.position = position;
-            self.apply_pending_events();
-        } else {
-            self.position = position;
-            self.replay_until_position();
-        }
-
+        self.position = position;
+        self.buffering = false;
         self.last_tick = Instant::now();
+
+        let (sent, active) = self.request_seek(position, active, display_snapshot);
+        if sent {
+            return;
+        }
+        self.playback = active;
+
+        self.replay_until_position();
     }
 
     fn update_progress_preview(&mut self, percent: f64) {
@@ -328,11 +462,14 @@ impl App {
     }
 
     fn finish_progress_drag_at(&mut self, target: Option<f64>) {
+        let display_snapshot = target
+            .and_then(|target| self.preview_snapshot(target))
+            .unwrap_or_else(|| self.current_display_snapshot());
         self.dragging_progress = false;
         self.preview_position = None;
 
         if let Some(target) = target {
-            self.seek(target);
+            self.seek_with_snapshot(target, display_snapshot);
         }
     }
 
@@ -362,7 +499,9 @@ impl App {
     }
 
     fn status(&self) -> &'static str {
-        if self.buffering {
+        if self.is_seeking() {
+            "Seeking"
+        } else if self.buffering {
             "Buffering"
         } else if self.playing {
             "Playing"
@@ -375,7 +514,18 @@ impl App {
         matches!(self.load_state, LoadState::Ready)
     }
 
-    fn display_lines(&self) -> Vec<Line<'static>> {
+    fn is_seeking(&self) -> bool {
+        self.pending_seek.is_some()
+    }
+
+    fn preview_snapshot(&self, position: f64) -> Option<Vec<Line<'static>>> {
+        self.preview_cache
+            .as_ref()?
+            .nearest_frame(position)
+            .map(|frame| frame.lines.clone())
+    }
+
+    fn current_display_snapshot(&self) -> Vec<Line<'static>> {
         if self.dragging_progress
             && let (Some(cache), Some(position)) = (&self.preview_cache, self.preview_position)
             && let Some(frame) = cache.nearest_frame(position)
@@ -383,7 +533,36 @@ impl App {
             return frame.lines.clone();
         }
 
-        self.emulator.lines(&self.header.terminal)
+        if let Some(pending) = &self.pending_seek {
+            return pending.display_snapshot.clone();
+        }
+
+        if let Some(playback) = &self.playback {
+            playback.emulator.lines(&self.header.terminal)
+        } else {
+            self.display_cache.clone()
+        }
+    }
+
+    fn display_lines(&mut self) -> Vec<Line<'static>> {
+        if self.dragging_progress
+            && let (Some(cache), Some(position)) = (&self.preview_cache, self.preview_position)
+            && let Some(frame) = cache.nearest_frame(position)
+        {
+            return frame.lines.clone();
+        }
+
+        if let Some(pending) = &self.pending_seek {
+            return pending.display_snapshot.clone();
+        }
+
+        if let Some(playback) = &self.playback {
+            let lines = playback.emulator.lines(&self.header.terminal);
+            self.display_cache = lines.clone();
+            lines
+        } else {
+            self.display_cache.clone()
+        }
     }
 
     fn loading_line(&self) -> Line<'static> {
@@ -404,25 +583,64 @@ impl App {
         ])
     }
 
+    fn seek_loading_text(&self) -> Option<String> {
+        let pending = self.pending_seek.as_ref()?;
+        let frame_duration = SEEK_LOADING_FRAME_DURATION.as_millis();
+        let frame_index = (pending
+            .started_at
+            .elapsed()
+            .as_millis()
+            .checked_div(frame_duration)
+            .unwrap_or(0)
+            % SEEK_LOADING_FRAMES.len() as u128) as usize;
+
+        Some(format!(
+            "{} seeking {}",
+            SEEK_LOADING_FRAMES[frame_index],
+            format_time(pending.target)
+        ))
+    }
+
+    fn handle_seek_ready(&mut self, result: SeekResult) {
+        if self
+            .pending_seek
+            .as_ref()
+            .is_none_or(|seek| seek.generation != result.generation)
+        {
+            self.recycle_playback(result.state);
+            return;
+        }
+
+        self.position = result.state.position;
+        self.playback = Some(result.state);
+        self.pending_seek = None;
+        self.last_tick = Instant::now();
+    }
+
     fn apply_pending_events(&mut self) {
-        while self.next_event < self.events.len() {
-            let Some(event) = self.events.get(self.next_event) else {
+        let Some(playback) = self.playback.as_mut() else {
+            return;
+        };
+
+        while playback.next_event < self.events.len() {
+            let Some(event) = self.events.get(playback.next_event) else {
                 break;
             };
 
-            if event.time > self.position {
+            if event.time > playback.position {
                 break;
             }
 
-            apply_cast_event(&mut self.emulator, event);
-            self.next_event += 1;
+            apply_cast_event(&mut playback.emulator, event);
+            playback.next_event += 1;
         }
     }
 
     fn replay_until_position(&mut self) {
-        self.emulator =
-            AlacrittyEmulator::new(self.header.width, self.header.height, &self.header.terminal);
-        self.next_event = 0;
+        self.pending_seek = None;
+        let mut playback = PlaybackState::new(&self.header);
+        playback.position = self.position;
+        self.playback = Some(playback);
         self.apply_pending_events();
     }
 }
@@ -774,6 +992,167 @@ fn flush_event_batch(tx: &Sender<WorkerMessage>, batch: &mut Vec<CastEvent>) -> 
     tx.send(WorkerMessage::EventsLoaded(events)).is_ok()
 }
 
+fn start_seek_engine(
+    events: Arc<Vec<CastEvent>>,
+    header: CastHeader,
+    duration: f64,
+    tx: Sender<WorkerMessage>,
+) -> Sender<SeekCommand> {
+    let (seek_tx, seek_rx) = mpsc::channel();
+    let _ = thread::spawn(move || SeekEngine::new(events, header, duration, seek_rx, tx).run());
+    seek_tx
+}
+
+struct SeekEngine {
+    events: Arc<Vec<CastEvent>>,
+    header: CastHeader,
+    duration: f64,
+    rx: Receiver<SeekCommand>,
+    tx: Sender<WorkerMessage>,
+    pool: BTreeMap<usize, PlaybackState>,
+}
+
+impl SeekEngine {
+    fn new(
+        events: Arc<Vec<CastEvent>>,
+        header: CastHeader,
+        duration: f64,
+        rx: Receiver<SeekCommand>,
+        tx: Sender<WorkerMessage>,
+    ) -> Self {
+        Self {
+            events,
+            header,
+            duration,
+            rx,
+            tx,
+            pool: BTreeMap::new(),
+        }
+    }
+
+    fn run(mut self) {
+        while let Ok(command) = self.rx.recv() {
+            match command {
+                SeekCommand::Seek(request) => self.run_seek(request),
+                SeekCommand::Recycle(state) => self.insert_state(state),
+            }
+        }
+    }
+
+    fn run_seek(&mut self, request: SeekRequest) {
+        let mut target = self.prepare_seek_request(request);
+
+        loop {
+            match self.drain_commands() {
+                Ok(Some(latest)) => target = latest,
+                Ok(None) => {}
+                Err(()) => return,
+            }
+
+            match self.replay_to_target(target) {
+                SeekWorkerResult::Ready(result) => {
+                    if self.tx.send(WorkerMessage::SeekReady(result)).is_err() {
+                        return;
+                    }
+                    break;
+                }
+                SeekWorkerResult::Interrupted(latest) => target = latest,
+                SeekWorkerResult::Closed => return,
+            }
+        }
+    }
+
+    fn prepare_seek_request(&mut self, mut request: SeekRequest) -> SeekTarget {
+        if let Some(active) = request.active.take() {
+            self.insert_state(active);
+        }
+
+        SeekTarget {
+            generation: request.generation,
+            target: request.target,
+        }
+    }
+
+    fn drain_commands(&mut self) -> Result<Option<SeekTarget>, ()> {
+        let mut latest = None;
+
+        loop {
+            match self.rx.try_recv() {
+                Ok(SeekCommand::Seek(request)) => {
+                    latest = Some(self.prepare_seek_request(request));
+                }
+                Ok(SeekCommand::Recycle(state)) => self.insert_state(state),
+                Err(TryRecvError::Empty) => return Ok(latest),
+                Err(TryRecvError::Disconnected) => return Err(()),
+            }
+        }
+    }
+
+    fn replay_to_target(&mut self, target: SeekTarget) -> SeekWorkerResult {
+        let target_next_event = target_next_event(self.events.as_ref(), target.target);
+        let mut state = self.take_state_for_target(target_next_event);
+
+        while state.next_event < target_next_event {
+            for _ in 0..SEEK_REPLAY_INTERRUPT_BATCH_SIZE {
+                if state.next_event >= target_next_event {
+                    break;
+                }
+
+                apply_cast_event(&mut state.emulator, &self.events[state.next_event]);
+                state.next_event += 1;
+            }
+
+            match self.drain_commands() {
+                Ok(Some(latest)) => {
+                    self.insert_state(state);
+                    return SeekWorkerResult::Interrupted(latest);
+                }
+                Ok(None) => {}
+                Err(()) => return SeekWorkerResult::Closed,
+            }
+        }
+
+        state.position = target.target;
+        SeekWorkerResult::Ready(Box::new(SeekResult {
+            generation: target.generation,
+            state,
+        }))
+    }
+
+    fn take_state_for_target(&mut self, target_next_event: usize) -> PlaybackState {
+        let key = self
+            .pool
+            .range(..=target_next_event)
+            .next_back()
+            .map(|(&key, _)| key);
+
+        key.and_then(|key| self.pool.remove(&key))
+            .unwrap_or_else(|| PlaybackState::new(&self.header))
+    }
+
+    fn insert_state(&mut self, state: PlaybackState) {
+        if self.is_complete(&state) {
+            return;
+        }
+
+        self.pool.entry(state.next_event).or_insert(state);
+    }
+
+    fn is_complete(&self, state: &PlaybackState) -> bool {
+        state.next_event >= self.events.len() && state.position >= self.duration
+    }
+}
+
+enum SeekWorkerResult {
+    Ready(Box<SeekResult>),
+    Interrupted(SeekTarget),
+    Closed,
+}
+
+fn target_next_event(events: &[CastEvent], target: f64) -> usize {
+    events.partition_point(|event| event.time <= target)
+}
+
 fn start_preview_builder(
     events: Arc<Vec<CastEvent>>,
     header: CastHeader,
@@ -904,20 +1283,33 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Span::raw("  Enter=go  Esc=cancel  e.g. 12.5, 01:20, 75%"),
         ]),
     };
-    let footer_layout = match app.header.terminal.term_type.as_deref() {
-        Some(term_type) => {
-            let width = term_type.len().saturating_add(2) as u16;
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(1), Constraint::Length(width)])
-                .split(vertical[2])
-        }
-        None => Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(0)])
-            .split(vertical[2]),
-    };
+    let seek_loading_text = app.seek_loading_text();
+    let seek_loading_width = seek_loading_text
+        .as_ref()
+        .map_or(0, |text| text.len().saturating_add(2) as u16);
+    let term_width = app
+        .header
+        .terminal
+        .term_type
+        .as_ref()
+        .map_or(0, |term_type| term_type.len().saturating_add(2) as u16);
+    let footer_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(seek_loading_width),
+            Constraint::Length(term_width),
+        ])
+        .split(vertical[2]);
     frame.render_widget(Paragraph::new(footer), footer_layout[0]);
+
+    if let Some(text) = seek_loading_text {
+        let text = Line::from(vec![Span::styled(text, Style::default().fg(Color::Yellow))]);
+        frame.render_widget(
+            Paragraph::new(text).alignment(Alignment::Right),
+            footer_layout[1],
+        );
+    }
 
     if let Some(term_type) = app.header.terminal.term_type.as_deref() {
         let term_type = Line::from(vec![Span::styled(
@@ -926,7 +1318,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         )]);
         frame.render_widget(
             Paragraph::new(term_type).alignment(Alignment::Right),
-            footer_layout[1],
+            footer_layout[2],
         );
     }
 }
@@ -970,6 +1362,9 @@ fn format_time(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(
@@ -978,10 +1373,12 @@ mod tests {
         );
     }
 
-    fn test_app(duration: f64) -> App {
+    fn test_header() -> CastHeader {
+        let file_id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "asciitape-tui-test-{}-{}.cast",
+            "asciitape-tui-test-{}-{}-{}.cast",
             std::process::id(),
+            file_id,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -990,14 +1387,27 @@ mod tests {
         std::fs::write(&path, "{\"version\":2,\"width\":80,\"height\":24}\n").unwrap();
         let header = crate::cast::load_cast_header(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        let emulator = AlacrittyEmulator::new(header.width, header.height, &header.terminal);
+        header
+    }
+
+    fn test_app(duration: f64) -> App {
+        let header = test_header();
+        let playback = PlaybackState::new(&header);
+        let display_cache = playback.emulator.lines(&header.terminal);
         let (worker_tx, worker_rx) = mpsc::channel();
+        let events = Arc::new(Vec::new());
+        let seek_tx = start_seek_engine(
+            Arc::clone(&events),
+            header.clone(),
+            duration,
+            worker_tx.clone(),
+        );
 
         App {
             header,
-            events: EventBuffer::Loaded(Arc::new(Vec::new())),
-            emulator,
-            next_event: 0,
+            events: EventBuffer::Loaded(events),
+            playback: Some(playback),
+            display_cache,
             position: 0.0,
             duration: Some(duration),
             loaded_until: duration,
@@ -1008,6 +1418,9 @@ mod tests {
             dragging_progress: false,
             preview_position: None,
             preview_cache: None,
+            pending_seek: None,
+            seek_generation: 0,
+            seek_tx: Some(seek_tx),
             progress_area: Some(Rect::new(0, 0, 10, 1)),
             last_tick: Instant::now(),
             mode: InputMode::Normal,
@@ -1048,6 +1461,207 @@ mod tests {
         assert!(rect_contains(rect, 5, 4));
         assert!(!rect_contains(rect, 6, 4));
         assert!(!rect_contains(rect, 5, 5));
+    }
+
+    #[test]
+    fn seek_engine_drain_commands_keeps_only_newest_target() {
+        let (seek_tx, seek_rx) = mpsc::channel();
+        let (worker_tx, _worker_rx) = mpsc::channel();
+        let mut engine = SeekEngine::new(
+            Arc::new(Vec::new()),
+            test_header(),
+            10.0,
+            seek_rx,
+            worker_tx,
+        );
+
+        seek_tx
+            .send(SeekCommand::Seek(SeekRequest {
+                generation: 1,
+                target: 1.0,
+                active: None,
+            }))
+            .unwrap();
+        seek_tx
+            .send(SeekCommand::Seek(SeekRequest {
+                generation: 2,
+                target: 2.0,
+                active: None,
+            }))
+            .unwrap();
+
+        let latest = engine.drain_commands().unwrap().unwrap();
+
+        assert_eq!(latest.generation, 2);
+        assert_close(latest.target, 2.0);
+        assert!(engine.drain_commands().unwrap().is_none());
+    }
+
+    #[test]
+    fn seek_engine_reuses_nearest_earlier_state_by_event_index() {
+        let (_seek_tx, seek_rx) = mpsc::channel();
+        let (worker_tx, _worker_rx) = mpsc::channel();
+        let header = test_header();
+        let events = Arc::new(vec![
+            CastEvent {
+                time: 1.0,
+                kind: EventKind::Output,
+                data: "a".to_string(),
+            },
+            CastEvent {
+                time: 2.0,
+                kind: EventKind::Output,
+                data: "b".to_string(),
+            },
+            CastEvent {
+                time: 3.0,
+                kind: EventKind::Output,
+                data: "c".to_string(),
+            },
+        ]);
+        let mut engine = SeekEngine::new(events, header.clone(), 10.0, seek_rx, worker_tx);
+        let mut early = PlaybackState::new(&header);
+        early.next_event = 1;
+        early.position = 1.0;
+        let mut nearest = PlaybackState::new(&header);
+        nearest.next_event = 2;
+        nearest.position = 2.0;
+
+        engine.insert_state(early);
+        engine.insert_state(nearest);
+
+        let state = engine.take_state_for_target(2);
+
+        assert_eq!(state.next_event, 2);
+        assert!(!engine.pool.contains_key(&2));
+        assert!(engine.pool.contains_key(&1));
+    }
+
+    #[test]
+    fn seek_engine_interrupts_replay_and_recycles_partial_state() {
+        let (seek_tx, seek_rx) = mpsc::channel();
+        let (worker_tx, _worker_rx) = mpsc::channel();
+        let header = test_header();
+        let events = Arc::new(
+            (0..SEEK_REPLAY_INTERRUPT_BATCH_SIZE + 10)
+                .map(|index| CastEvent {
+                    time: index as f64,
+                    kind: EventKind::Other,
+                    data: String::new(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut engine = SeekEngine::new(events, header, 10_000.0, seek_rx, worker_tx);
+
+        seek_tx
+            .send(SeekCommand::Seek(SeekRequest {
+                generation: 2,
+                target: 1.0,
+                active: None,
+            }))
+            .unwrap();
+
+        let result = engine.replay_to_target(SeekTarget {
+            generation: 1,
+            target: 10_000.0,
+        });
+
+        match result {
+            SeekWorkerResult::Interrupted(target) => {
+                assert_eq!(target.generation, 2);
+                assert_close(target.target, 1.0);
+            }
+            SeekWorkerResult::Ready(_) | SeekWorkerResult::Closed => {
+                panic!("expected replay interruption")
+            }
+        }
+        assert!(engine.pool.contains_key(&SEEK_REPLAY_INTERRUPT_BATCH_SIZE));
+    }
+
+    #[test]
+    fn seek_engine_discards_states_that_reached_end() {
+        let (_seek_tx, seek_rx) = mpsc::channel();
+        let (worker_tx, _worker_rx) = mpsc::channel();
+        let header = test_header();
+        let mut engine = SeekEngine::new(
+            Arc::new(Vec::new()),
+            header.clone(),
+            10.0,
+            seek_rx,
+            worker_tx,
+        );
+        let mut state = PlaybackState::new(&header);
+        state.position = 10.0;
+
+        engine.insert_state(state);
+
+        assert!(engine.pool.is_empty());
+    }
+
+    #[test]
+    fn mouse_seek_uses_target_preview_as_pending_snapshot() {
+        let mut app = test_app(10.0);
+        app.dragging_progress = true;
+        app.preview_position = Some(0.0);
+        app.preview_cache = Some(PreviewCache {
+            duration: 10.0,
+            frames: vec![
+                PreviewFrame {
+                    lines: vec![Line::from("old preview")],
+                },
+                PreviewFrame {
+                    lines: vec![Line::from("target preview")],
+                },
+            ],
+        });
+
+        app.finish_progress_drag_at(Some(10.0));
+
+        assert!(!app.dragging_progress);
+        assert_eq!(app.preview_position, None);
+        assert_eq!(
+            app.pending_seek.as_ref().unwrap().display_snapshot,
+            vec![Line::from("target preview")]
+        );
+        assert_eq!(app.display_lines(), vec![Line::from("target preview")]);
+    }
+
+    #[test]
+    fn stale_seek_result_preserves_newer_pending_snapshot() {
+        let mut app = test_app(10.0);
+        app.pending_seek = Some(PendingSeek {
+            generation: 2,
+            target: 2.0,
+            started_at: Instant::now(),
+            display_snapshot: vec![Line::from("newer snapshot")],
+        });
+
+        app.handle_seek_ready(SeekResult {
+            generation: 1,
+            state: PlaybackState::new(&app.header),
+        });
+
+        let pending = app.pending_seek.as_ref().unwrap();
+        assert_eq!(pending.generation, 2);
+        assert_close(pending.target, 2.0);
+        assert_eq!(pending.display_snapshot, vec![Line::from("newer snapshot")]);
+        assert_eq!(app.display_lines(), vec![Line::from("newer snapshot")]);
+    }
+
+    #[test]
+    fn seek_marks_loading_and_new_seek_replaces_target() {
+        let mut app = test_app(10.0);
+
+        app.seek(8.0);
+        let first_generation = app.pending_seek.as_ref().unwrap().generation;
+        app.seek(2.0);
+
+        let pending = app.pending_seek.as_ref().unwrap();
+        assert!(pending.generation > first_generation);
+        assert_close(pending.target, 2.0);
+        assert_close(app.position, 2.0);
+        assert_eq!(app.status(), "Seeking");
+        assert!(app.seek_loading_text().unwrap().contains("seeking"));
     }
 
     #[test]
