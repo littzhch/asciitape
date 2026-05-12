@@ -1,6 +1,6 @@
 [package]
 name = "asciitape"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.95"
 description = "A terminal UI player for asciinema v2 and v3 cast recordings"
