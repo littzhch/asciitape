@@ -24,6 +24,6 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cast = cast::load_cast(&args.cast)?;
-    tui::run(cast, args.paused, args.fullscreen)
+    let header = cast::load_cast_header(&args.cast)?;
+    tui::run(args.cast, header, args.paused, args.fullscreen)
 }

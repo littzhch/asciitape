@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufRead, BufReader},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -6,21 +11,39 @@ use serde_json::Value;
 
 use crate::terminal::{TerminalMetadata, TerminalThemeRaw, terminal_metadata};
 
-#[derive(Debug)]
-pub struct Cast {
+#[derive(Debug, Clone)]
+pub struct CastHeader {
     pub width: u16,
     pub height: u16,
-    pub duration: f64,
     pub title: Option<String>,
     pub terminal: TerminalMetadata,
-    pub events: Vec<CastEvent>,
+    declared_duration: Option<f64>,
+    format: CastFormat,
+    idle_time_limit: Option<f64>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
+struct Cast {
+    width: u16,
+    height: u16,
+    duration: f64,
+    title: Option<String>,
+    terminal: TerminalMetadata,
+    events: Vec<CastEvent>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CastEvent {
     pub time: f64,
     pub kind: EventKind,
     pub data: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CastFormat {
+    V2,
+    V3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,95 +92,55 @@ struct CastTerm {
     theme: Option<TerminalThemeRaw>,
 }
 
-pub fn load_cast(path: &PathBuf) -> Result<Cast> {
-    let contents = fs::read_to_string(path)
+pub fn load_cast_header(path: &Path) -> Result<CastHeader> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open cast file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut header_line = String::new();
+    let bytes_read = reader
+        .read_line(&mut header_line)
         .with_context(|| format!("failed to read cast file {}", path.display()))?;
 
-    parse_cast(&contents)
+    if bytes_read == 0 {
+        bail!("empty cast file");
+    }
+
+    parse_cast_header_line(&header_line)
 }
 
-fn parse_cast(contents: &str) -> Result<Cast> {
-    let mut lines = contents.lines();
-    let header_line = lines.next().context("empty cast file")?;
+fn parse_cast_header_line(header_line: &str) -> Result<CastHeader> {
     let version: VersionHeader =
         serde_json::from_str(header_line).context("invalid cast header")?;
 
     match version.version {
-        2 => parse_cast_v2(header_line, lines.enumerate()),
-        3 => parse_cast_v3(header_line, lines.enumerate()),
+        2 => parse_cast_header_v2(header_line),
+        3 => parse_cast_header_v3(header_line),
         version => {
             bail!("unsupported asciinema cast version {version}; only v2 and v3 are supported")
         }
     }
 }
 
-fn parse_cast_v2<'a>(
-    header_line: &str,
-    lines: impl Iterator<Item = (usize, &'a str)>,
-) -> Result<Cast> {
+fn parse_cast_header_v2(header_line: &str) -> Result<CastHeader> {
     let header: CastHeaderV2 = serde_json::from_str(header_line).context("invalid v2 header")?;
 
     validate_size(header.width, header.height)?;
     let idle_time_limit = validate_idle_time_limit(header.idle_time_limit)?;
-
-    let mut events = Vec::new();
-    let mut previous_raw_time = 0.0;
-    let mut adjusted_time = 0.0;
-
-    for (line_number, line) in lines {
-        let Some(raw_event) = parse_event_line(line, line_number + 2)? else {
-            continue;
-        };
-
-        if raw_event.time < previous_raw_time {
-            bail!(
-                "event time at line {} is earlier than the previous event",
-                line_number + 2
-            );
-        }
-
-        let event_time = match idle_time_limit {
-            Some(limit) => {
-                adjusted_time += (raw_event.time - previous_raw_time).min(limit);
-                adjusted_time
-            }
-            None => raw_event.time,
-        };
-        previous_raw_time = raw_event.time;
-
-        events.push(CastEvent {
-            time: event_time,
-            kind: raw_event.kind,
-            data: raw_event.data,
-        });
-    }
-
-    let event_duration = events.last().map_or(0.0, |event| event.time);
-    let duration = if idle_time_limit.is_some() {
-        event_duration
-    } else {
-        header
-            .duration
-            .unwrap_or(event_duration)
-            .max(event_duration)
-    };
     let term_type = header.env.as_ref().and_then(|env| env.get("TERM").cloned());
     let terminal = terminal_metadata(term_type, header.theme)?;
 
-    Ok(Cast {
+    Ok(CastHeader {
         width: header.width,
         height: header.height,
-        duration,
         title: header.title,
         terminal,
-        events,
+        declared_duration: header.duration,
+        format: CastFormat::V2,
+        idle_time_limit,
     })
 }
 
-fn parse_cast_v3<'a>(
-    header_line: &str,
-    lines: impl Iterator<Item = (usize, &'a str)>,
-) -> Result<Cast> {
+fn parse_cast_header_v3(header_line: &str) -> Result<CastHeader> {
     let header: CastHeaderV3 = serde_json::from_str(header_line).context("invalid v3 header")?;
 
     let width = header.term.cols;
@@ -166,32 +149,127 @@ fn parse_cast_v3<'a>(
     let idle_time_limit = validate_idle_time_limit(header.idle_time_limit)?;
     let terminal = terminal_metadata(header.term.term_type, header.term.theme)?;
 
-    let mut events = Vec::new();
-    let mut position = 0.0;
+    Ok(CastHeader {
+        width,
+        height,
+        title: header.title,
+        terminal,
+        declared_duration: None,
+        format: CastFormat::V3,
+        idle_time_limit,
+    })
+}
 
-    for (line_number, line) in lines {
-        let Some(raw_event) = parse_event_line(line, line_number + 2)? else {
-            continue;
+pub struct CastEventParser {
+    format: CastFormat,
+    idle_time_limit: Option<f64>,
+    declared_duration: Option<f64>,
+    previous_raw_time: f64,
+    adjusted_time: f64,
+    position: f64,
+    event_duration: f64,
+    line_number: usize,
+}
+
+impl CastEventParser {
+    pub fn new(header: &CastHeader) -> Self {
+        Self {
+            format: header.format,
+            idle_time_limit: header.idle_time_limit,
+            declared_duration: header.declared_duration,
+            previous_raw_time: 0.0,
+            adjusted_time: 0.0,
+            position: 0.0,
+            event_duration: 0.0,
+            line_number: 2,
+        }
+    }
+
+    pub fn parse_line(&mut self, line: &str) -> Result<Option<CastEvent>> {
+        let line_number = self.line_number;
+        self.line_number += 1;
+
+        let Some(raw_event) = parse_event_line(line, line_number)? else {
+            return Ok(None);
         };
 
-        position += match idle_time_limit {
+        match self.format {
+            CastFormat::V2 => self.parse_v2_event(raw_event, line_number),
+            CastFormat::V3 => Ok(Some(self.parse_v3_event(raw_event))),
+        }
+    }
+
+    pub fn duration(&self) -> f64 {
+        match self.format {
+            CastFormat::V2 if self.idle_time_limit.is_none() => self
+                .declared_duration
+                .unwrap_or(self.event_duration)
+                .max(self.event_duration),
+            CastFormat::V2 | CastFormat::V3 => self.event_duration,
+        }
+    }
+
+    fn parse_v2_event(
+        &mut self,
+        raw_event: RawEvent,
+        line_number: usize,
+    ) -> Result<Option<CastEvent>> {
+        if raw_event.time < self.previous_raw_time {
+            bail!("event time at line {line_number} is earlier than the previous event");
+        }
+
+        let event_time = match self.idle_time_limit {
+            Some(limit) => {
+                self.adjusted_time += (raw_event.time - self.previous_raw_time).min(limit);
+                self.adjusted_time
+            }
+            None => raw_event.time,
+        };
+        self.previous_raw_time = raw_event.time;
+        self.event_duration = event_time;
+
+        Ok(Some(CastEvent {
+            time: event_time,
+            kind: raw_event.kind,
+            data: raw_event.data,
+        }))
+    }
+
+    fn parse_v3_event(&mut self, raw_event: RawEvent) -> CastEvent {
+        self.position += match self.idle_time_limit {
             Some(limit) => raw_event.time.min(limit),
             None => raw_event.time,
         };
+        self.event_duration = self.position;
 
-        events.push(CastEvent {
-            time: position,
+        CastEvent {
+            time: self.position,
             kind: raw_event.kind,
             data: raw_event.data,
-        });
+        }
+    }
+}
+
+#[cfg(test)]
+fn parse_cast(contents: &str) -> Result<Cast> {
+    let mut lines = contents.lines();
+    let header_line = lines.next().context("empty cast file")?;
+    let header = parse_cast_header_line(header_line)?;
+    let mut parser = CastEventParser::new(&header);
+    let mut events = Vec::new();
+
+    for line in lines {
+        if let Some(event) = parser.parse_line(line)? {
+            events.push(event);
+        }
     }
 
     Ok(Cast {
-        width,
-        height,
-        duration: events.last().map_or(0.0, |event| event.time),
+        width: header.width,
+        height: header.height,
+        duration: parser.duration(),
         title: header.title,
-        terminal,
+        terminal: header.terminal,
         events,
     })
 }
