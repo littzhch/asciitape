@@ -4,6 +4,7 @@ A convenient TUI player for asciinema recordings (v2 and v3 `.cast`).
 
 ## Features
 - Supports progress bar with mouse drag.
+- Supports `.cast.gz`, `.cast.xz`, `.cast.zst`, etc. file formats
 - Supports pause, seek, fast forward, rewind, speed control, and fullscreen mode.
 
 ## Usage
