@@ -1,13 +1,18 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::Path,
 };
 
 use anyhow::{Context, Result, bail};
+use bzip2::read::BzDecoder;
+use flate2::read::MultiGzDecoder;
+use lz4_flex::frame::FrameDecoder as Lz4Decoder;
 use serde::Deserialize;
 use serde_json::Value;
+use xz2::read::XzDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 use crate::terminal::{TerminalMetadata, TerminalThemeRaw, terminal_metadata};
 
@@ -53,6 +58,16 @@ pub enum EventKind {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionFormat {
+    Plain,
+    Gzip,
+    Xz,
+    Zstd,
+    Bzip2,
+    Lz4,
+}
+
 #[derive(Debug)]
 struct RawEvent {
     time: f64,
@@ -93,9 +108,7 @@ struct CastTerm {
 }
 
 pub fn load_cast_header(path: &Path) -> Result<CastHeader> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open cast file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_cast_reader(path)?;
     let mut header_line = String::new();
     let bytes_read = reader
         .read_line(&mut header_line)
@@ -106,6 +119,59 @@ pub fn load_cast_header(path: &Path) -> Result<CastHeader> {
     }
 
     parse_cast_header_line(&header_line)
+}
+
+pub(crate) fn open_cast_reader(path: &Path) -> Result<BufReader<Box<dyn Read>>> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open cast file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let compression = CompressionFormat::detect(
+        reader
+            .fill_buf()
+            .with_context(|| format!("failed to read file header {}", path.display()))?,
+    );
+
+    let reader: Box<dyn Read> = match compression {
+        CompressionFormat::Plain => Box::new(reader),
+        CompressionFormat::Gzip => Box::new(MultiGzDecoder::new(reader)),
+        CompressionFormat::Xz => Box::new(XzDecoder::new(reader)),
+        CompressionFormat::Zstd => Box::new(
+            ZstdDecoder::new(reader)
+                .with_context(|| format!("failed to initialize zstd decoder {}", path.display()))?,
+        ),
+        CompressionFormat::Bzip2 => Box::new(BzDecoder::new(reader)),
+        CompressionFormat::Lz4 => Box::new(Lz4Decoder::new(reader)),
+    };
+
+    Ok(BufReader::new(reader))
+}
+
+impl CompressionFormat {
+    fn detect(bytes: &[u8]) -> Self {
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            Self::Gzip
+        } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+            Self::Xz
+        } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+            || is_zstd_skippable_frame_header(bytes)
+        {
+            Self::Zstd
+        } else if bytes.starts_with(b"BZh") {
+            Self::Bzip2
+        } else if bytes.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+            Self::Lz4
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+fn is_zstd_skippable_frame_header(bytes: &[u8]) -> bool {
+    bytes.len() >= 4
+        && (0x50..=0x5f).contains(&bytes[0])
+        && bytes[1] == 0x2a
+        && bytes[2] == 0x4d
+        && bytes[3] == 0x18
 }
 
 fn parse_cast_header_line(header_line: &str) -> Result<CastHeader> {
@@ -332,10 +398,73 @@ fn parse_event(value: Value) -> Result<RawEvent> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        io::{Read as _, Write as _},
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use ratatui::style::Color;
 
     use super::*;
     use crate::terminal::TerminalProfile;
+
+    const SIMPLE_CAST: &str = r#"{"version":2,"width":80,"height":24,"duration":1.0}
+[0.1,"o","hello"]
+"#;
+
+    static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestFile {
+        path: PathBuf,
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn write_temp_file(label: &str, bytes: &[u8]) -> TestFile {
+        let file_id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "asciitape-cast-test-{}-{file_id}-{label}",
+            std::process::id()
+        ));
+        fs::write(&path, bytes).unwrap();
+        TestFile { path }
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn xz(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zstd(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn bzip2(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn lz4(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(
@@ -444,5 +573,36 @@ mod tests {
         assert_close(cast.events[0].time, 1.5);
         assert_close(cast.events[1].time, 3.0);
         assert_close(cast.duration, 3.0);
+    }
+
+    #[test]
+    fn open_cast_reader_detects_common_compression_by_magic() {
+        let cases = [
+            ("gzip-without-cast-suffix", gzip(SIMPLE_CAST.as_bytes())),
+            ("xz-without-cast-suffix", xz(SIMPLE_CAST.as_bytes())),
+            ("zstd-without-cast-suffix", zstd(SIMPLE_CAST.as_bytes())),
+            ("bzip2-without-cast-suffix", bzip2(SIMPLE_CAST.as_bytes())),
+            ("lz4-without-cast-suffix", lz4(SIMPLE_CAST.as_bytes())),
+        ];
+
+        for (label, bytes) in cases {
+            let file = write_temp_file(label, &bytes);
+            let mut reader = open_cast_reader(&file.path).unwrap();
+            let mut contents = String::new();
+
+            reader.read_to_string(&mut contents).unwrap();
+
+            assert_eq!(contents, SIMPLE_CAST, "{label}");
+            assert_eq!(load_cast_header(&file.path).unwrap().width, 80, "{label}");
+        }
+    }
+
+    #[test]
+    fn load_cast_header_ignores_suffix_for_plain_input() {
+        let file = write_temp_file("plain.cast.gz", SIMPLE_CAST.as_bytes());
+        let header = load_cast_header(&file.path).unwrap();
+
+        assert_eq!(header.width, 80);
+        assert_eq!(header.height, 24);
     }
 }

@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::File,
-    io::{self, BufRead, BufReader, Stdout},
+    io::{self, BufRead, Stdout},
     path::PathBuf,
     sync::{
         Arc,
@@ -30,7 +29,7 @@ use ratatui::{
 };
 
 use crate::{
-    cast::{CastEvent, CastEventParser, CastHeader, EventKind},
+    cast::{CastEvent, CastEventParser, CastHeader, EventKind, open_cast_reader},
     terminal::AlacrittyEmulator,
 };
 
@@ -944,9 +943,7 @@ fn start_event_loader(path: PathBuf, header: CastHeader, tx: Sender<WorkerMessag
 }
 
 fn load_events(path: PathBuf, header: CastHeader, tx: &Sender<WorkerMessage>) -> Result<()> {
-    let file = File::open(&path)
-        .with_context(|| format!("failed to open cast file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_cast_reader(&path)?;
     let mut header_line = String::new();
     let bytes_read = reader
         .read_line(&mut header_line)

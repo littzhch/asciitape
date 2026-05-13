@@ -27,6 +27,7 @@ Examples:
 asciitape demo.cast
 asciitape --paused demo.cast
 asciitape --fullscreen demo.cast
+asciitape demo.cast.zst
 ```
 
 ## Controls
@@ -64,6 +65,7 @@ Supported:
 
 - asciinema v2 newline-delimited JSON cast files
 - asciinema v3 newline-delimited JSON cast files
+- plain files and gzip, xz, zstd, bzip2, or lz4-compressed files; compression is detected from file headers, not filename suffixes
 
 The internal timeline is normalized to absolute seconds. v2 absolute event times are used directly, while v3 event intervals are accumulated.
 
