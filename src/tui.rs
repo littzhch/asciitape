@@ -36,6 +36,7 @@ use crate::{
 const PREVIEW_FRAME_COUNT: usize = 2000;
 const SHORT_SEEK_SECS: f64 = 5.0;
 const LONG_SEEK_SECS: f64 = 30.0;
+const MAX_PLAYBACK_SPEED: f64 = 10.0;
 const TICK_RATE: Duration = Duration::from_millis(16);
 const EVENT_BATCH_SIZE: usize = 512;
 const EVENT_BATCH_LATENCY: Duration = Duration::from_millis(8);
@@ -478,7 +479,7 @@ impl App {
     }
 
     fn speed_up(&mut self) {
-        self.speed = (self.speed + 0.25).min(4.0);
+        self.speed = (self.speed + 0.25).min(MAX_PLAYBACK_SPEED);
     }
 
     fn speed_down(&mut self) {
@@ -1659,6 +1660,17 @@ mod tests {
         assert_close(app.position, 2.0);
         assert_eq!(app.status(), "Seeking");
         assert!(app.seek_loading_text().unwrap().contains("seeking"));
+    }
+
+    #[test]
+    fn speed_up_caps_at_ten_x() {
+        let mut app = test_app(10.0);
+        app.speed = 9.75;
+
+        app.speed_up();
+        app.speed_up();
+
+        assert_close(app.speed, 10.0);
     }
 
     #[test]
